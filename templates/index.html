@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>11.41B Report Generator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #f0f4f8;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 16px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.10);
+      padding: 36px 40px;
+      width: 100%;
+      max-width: 560px;
+    }
+
+    h1 {
+      font-size: 1.35rem;
+      color: #1a3c5e;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      font-size: 0.85rem;
+      color: #607080;
+      margin-bottom: 28px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #334;
+      margin-bottom: 5px;
+    }
+    label span.optional {
+      font-weight: 400;
+      color: #888;
+      margin-left: 4px;
+    }
+
+    input[type="text"], select {
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid #cdd6df;
+      border-radius: 6px;
+      font-size: 0.95rem;
+      color: #222;
+      background: #fafcff;
+      transition: border 0.2s;
+    }
+    input[type="text"]:focus, select:focus {
+      outline: none;
+      border-color: #3a7bd5;
+      background: #fff;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    .row2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .hint {
+      font-size: 0.76rem;
+      color: #8899aa;
+      margin-top: 4px;
+    }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 12px;
+      background: #1a3c5e;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 6px;
+    }
+    button[type="submit"]:hover { background: #26527f; }
+    button[type="submit"]:disabled { background: #8aabb8; cursor: not-allowed; }
+
+    #status {
+      margin-top: 18px;
+      padding: 12px 16px;
+      border-radius: 6px;
+      font-size: 0.88rem;
+      display: none;
+    }
+    #status.info    { background: #e8f0fe; color: #1a3c5e; display: block; }
+    #status.success { background: #e6f4ea; color: #256029; display: block; }
+    #status.error   { background: #fce8e6; color: #8b1a1a; display: block; }
+
+    .loader {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid #fff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    hr { border: none; border-top: 1px solid #e8ecf0; margin: 24px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>11.41B Status Report Generator</h1>
+    <p class="subtitle">Generates a Word report from the standard 11.41B template.</p>
+
+    <form id="reportForm">
+
+      <!-- Notice ID -->
+      <div class="form-group">
+        <label for="notice_id">Target Notice ID <span class="optional">(required)</span></label>
+        {% if notice_ids %}
+        <select id="notice_id" name="notice_id" required>
+          <option value="">— Select a notice —</option>
+          {% for nid in notice_ids %}
+          <option value="{{ nid }}">{{ nid }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <input type="text" id="notice_id" name="notice_id" required
+               placeholder="e.g. 103500417" />
+        {% endif %}
+        <p class="hint">Folder name under M:\BRSSD\CSS\11.41B\2026\</p>
+      </div>
+
+      <hr />
+
+      <div class="row2">
+        <!-- WM number -->
+        <div class="form-group">
+          <label for="wm_num">Meeting No. (WM) <span class="optional">(optional)</span></label>
+          <input type="text" id="wm_num" name="wm_num"
+                 placeholder="e.g. 1668" maxlength="10" />
+          <p class="hint">Used in filename &amp; title. Defaults to <em>xxxx</em>.</p>
+        </div>
+
+        <!-- D number -->
+        <div class="form-group">
+          <label for="d_num">Document No. (D) <span class="optional">(optional)</span></label>
+          <input type="text" id="d_num" name="d_num"
+                 placeholder="e.g. 72317" maxlength="10" />
+          <p class="hint">Used in filename. Defaults to <em>xxxxx</em>.</p>
+        </div>
+      </div>
+
+      <!-- Meeting date -->
+      <div class="form-group">
+        <label for="meeting_date">Meeting Date <span class="optional">(optional)</span></label>
+        <input type="text" id="meeting_date" name="meeting_date"
+               placeholder="e.g. 4 June 2026" />
+        <p class="hint">Appears in the document title. Defaults to today's date if blank.</p>
+      </div>
+
+      <button type="submit" id="submitBtn">Generate Report</button>
+    </form>
+
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const form      = document.getElementById('reportForm');
+    const statusDiv = document.getElementById('status');
+    const submitBtn = document.getElementById('submitBtn');
+
+    function showStatus(msg, type) {
+      statusDiv.className = type;
+      statusDiv.innerHTML = msg;
+    }
+
+    form.addEventListener('submit', async function (e) {
+      e.preventDefault();
+
+      showStatus('<span class="loader"></span> Generating report…', 'info');
+      submitBtn.disabled = true;
+
+      const formData = new FormData(form);
+
+      try {
+        const resp = await fetch('/generate', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!resp.ok) {
+          // Try to parse JSON error
+          const ct = resp.headers.get('Content-Type') || '';
+          if (ct.includes('application/json')) {
+            const data = await resp.json();
+            showStatus('&#x26A0; ' + (data.error || 'Unknown error.'), 'error');
+          } else {
+            showStatus('&#x26A0; Server error: ' + resp.status, 'error');
+          }
+          return;
+        }
+
+        // Get filename from Content-Disposition
+        const cd       = resp.headers.get('Content-Disposition') || '';
+        const match    = cd.match(/filename="?([^";]+)"?/);
+        const filename = match ? match[1] : 'report.docx';
+
+        const blob = await resp.blob();
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href     = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000);
+
+        showStatus(
+          '&#x2713; Report generated: <strong>' + filename + '</strong>',
+          'success'
+        );
+      } catch (err) {
+        showStatus('&#x26A0; Network error: ' + err.message, 'error');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
