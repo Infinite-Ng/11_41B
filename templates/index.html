@@ -65,6 +65,18 @@
       border-color: #3a7bd5;
       background: #fff;
     }
+    select[multiple] {
+      min-height: 120px;
+      padding: 6px 8px;
+    }
+    kbd {
+      background: #e8ecf0;
+      border: 1px solid #c0cad4;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 0.78rem;
+      font-family: monospace;
+    }
 
     .form-group {
       margin-bottom: 20px;
@@ -135,17 +147,16 @@
       <div class="form-group">
         <label for="notice_id">Target Notice ID <span class="optional">(required)</span></label>
         {% if notice_ids %}
-        <select id="notice_id" name="notice_id" required>
-          <option value="">— Select a notice —</option>
+        <select id="notice_id" name="notice_id" multiple size="6">
           {% for nid in notice_ids %}
           <option value="{{ nid }}">{{ nid }}</option>
           {% endfor %}
         </select>
         {% else %}
         <input type="text" id="notice_id" name="notice_id" required
-               placeholder="e.g. 103500417" />
+               placeholder="e.g. 103500417, 103500418" />
         {% endif %}
-        <p class="hint">Folder name under M:\BRSSD\CSS\11.41B\2026\</p>
+        <p class="hint">Folder under M:\BRSSD\CSS\11.41B\2026\ &nbsp;&middot;&nbsp; Hold <kbd>Ctrl</kbd> to select multiple</p>
       </div>
 
       <hr />
@@ -194,6 +205,15 @@
 
     form.addEventListener('submit', async function (e) {
       e.preventDefault();
+
+      // Validate that at least one notice ID is selected/entered
+      const noticeEl = document.getElementById('notice_id');
+      if (noticeEl.tagName === 'SELECT' && noticeEl.multiple) {
+        if (noticeEl.selectedOptions.length === 0) {
+          showStatus('&#x26A0; Please select at least one Notice ID.', 'error');
+          return;
+        }
+      }
 
       showStatus('<span class="loader"></span> Generating report…', 'info');
       submitBtn.disabled = true;

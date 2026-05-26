@@ -5,6 +5,7 @@ a Word document report from the standard template.
 """
 import os
 import io
+import re
 import copy
 import glob
 from datetime import datetime
@@ -33,6 +34,15 @@ def ordinal_suffix(n: int) -> str:
 
 def ordinal(n: int) -> str:
     return f'{n}{ordinal_suffix(n)}'
+
+
+def _numeric_key(v: str):
+    """Sort provision values numerically: '9.7' < '9.13' < '9.14'."""
+    try:
+        parts = v.split('.')
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return (0, v)
 
 
 def _make_run_xml(
@@ -127,10 +137,10 @@ def get_mdb_data(notice_id: str) -> dict:
             'd_rcv':    d_rcv,
         })
 
-    # provn.agree_st ──────────────────────────────────────────────────────────
-    cursor.execute("SELECT COUNT(*) FROM provn WHERE agree_st <> 'O'")
-    non_o_count = cursor.fetchone()[0]
-    still_exist = 'YES' if non_o_count > 0 else 'NO'
+    # provn.coord_prov: YES if any entry contains '11.41' ────────────────────
+    cursor.execute("SELECT COUNT(*) FROM provn WHERE coord_prov LIKE '%11.41%'")
+    has_1141 = cursor.fetchone()[0]
+    still_exist = 'YES' if has_1141 > 0 else 'NO'
 
     conn.close()
     return {'com_el': com_el_rows, 'still_exist': still_exist}
@@ -194,14 +204,6 @@ def get_history_data(notice_id: str) -> dict:
             adms.add(adm)
 
     wb.close()
-
-    def _numeric_key(v: str):
-        """Sort e.g. '9.7' < '9.13' < '9.14' numerically."""
-        try:
-            parts = v.split('.')
-            return tuple(int(p) for p in parts)
-        except ValueError:
-            return (0, v)
 
     return {
         'provn_targets': sorted(provn_targets, key=_numeric_key),
@@ -300,6 +302,23 @@ def _replace_provn_section(para, provn_targets: list) -> None:
         p_elem.insert(insert_pos + offset, elem)
 
 
+def _update_footer(doc, wm_num: str, d_num: str) -> None:
+    """
+    Update document number occurrences in all section footers.
+    Replaces 'WM<digits>' with 'WM<wm_num>' and standalone 'D<digits>'
+    (not preceded by a letter) with 'D<d_num>' in each footer run.
+    """
+    for section in doc.sections:
+        for para in section.footer.paragraphs:
+            for run in para.runs:
+                t = run.text
+                if wm_num:
+                    t = re.sub(r'WM\d+', f'WM{wm_num}', t)
+                if d_num:
+                    t = re.sub(r'(?<![A-Za-z])D\d+', f'D{d_num}', t)
+                run.text = t
+
+
 def _set_cell_text(cell, text: str) -> None:
     """
     Clear a table cell and set plain text.
@@ -346,10 +365,11 @@ def _set_cell_text(cell, text: str) -> None:
     p_elem.append(r)
 
 
-def _replace_table_data(table, mdb_data: dict, history_data: dict) -> None:
+def _replace_table_data(table, notice_data_list: list) -> None:
     """
     Remove all sample data rows (row index >= 1) and add one row per com_el
-    record, cloning the first data row's XML for formatting.
+    record across all notices, cloning the first data row's XML for formatting.
+    notice_data_list: list of (mdb_data, history_data) tuples.
     """
     # Save the first data row as formatting template (before deletion)
     template_tr = None
@@ -360,46 +380,59 @@ def _replace_table_data(table, mdb_data: dict, history_data: dict) -> None:
     while len(table.rows) > 1:
         table._tbl.remove(table.rows[1]._tr)
 
-    adm_coord = ', '.join(history_data['adms'])
+    for mdb_data, history_data in notice_data_list:
+        adm_coord = ', '.join(history_data['adms'])
+        provn_col = ', '.join(
+            f'No. {pt} |O|' for pt in history_data['provn_targets']
+        )
 
-    for record in mdb_data['com_el']:
-        # Clone template row or add a new one
-        if template_tr is not None:
-            new_tr = copy.deepcopy(template_tr)
-            table._tbl.append(new_tr)
-            new_row = table.rows[-1]
-        else:
-            new_row = table.add_row()
+        for record in mdb_data['com_el']:
+            # Clone template row or add a new one
+            if template_tr is not None:
+                new_tr = copy.deepcopy(template_tr)
+                table._tbl.append(new_tr)
+                new_row = table.rows[-1]
+            else:
+                new_row = table.add_row()
 
-        values = [
-            record['ntc_id'],       # Notice ID
-            record['adm'],          # ADM
-            record['sat_name'],     # STATION
-            record['type'],         # TYPE (G/N)
-            record['d_rcv'],        # Date of Receipt
-            adm_coord,              # ADM Coordination completed
-            '',                     # ADM Coordination no longer required
-            '',                     # Findings review required (13A)
-            mdb_data['still_exist'],# 11.41 still exist
-        ]
-        for i, val in enumerate(values):
-            if i < len(new_row.cells):
-                _set_cell_text(new_row.cells[i], val)
+            values = [
+                record['ntc_id'],        # Notice ID
+                record['adm'],           # ADM
+                record['sat_name'],      # STATION
+                record['type'],          # TYPE (G/N)
+                record['d_rcv'],         # Date of Receipt
+                adm_coord,               # ADM Coordination completed
+                '',                      # ADM Coordination no longer required
+                '',                      # Findings review required (13A)
+                mdb_data['still_exist'], # 11.41 still exist
+                provn_col,               # Provision updated from 11.41|X|
+            ]
+            for i, val in enumerate(values):
+                if i < len(new_row.cells):
+                    _set_cell_text(new_row.cells[i], val)
 
 
 def generate_report(
-    notice_id: str,
+    notice_ids: list,
     wm_num: str,
     d_num: str,
     meeting_date: str,
 ) -> tuple:
     """
-    Generate the Word report.
+    Generate the Word report for one or more notice IDs.
     Returns (BytesIO buffer, filename string).
     """
-    # ── Gather data ───────────────────────────────────────────────────────────
-    mdb_data     = get_mdb_data(notice_id)
-    history_data = get_history_data(notice_id)
+    # ── Gather data for all notices ───────────────────────────────────────────
+    notice_data_list = []
+    all_provn_targets: set = set()
+
+    for notice_id in notice_ids:
+        mdb_data     = get_mdb_data(notice_id)
+        history_data = get_history_data(notice_id)
+        notice_data_list.append((mdb_data, history_data))
+        all_provn_targets.update(history_data['provn_targets'])
+
+    combined_provn_targets = sorted(all_provn_targets, key=_numeric_key)
 
     # ── Load a fresh copy of the template ────────────────────────────────────
     doc = Document(TEMPLATE_PATH)
@@ -413,19 +446,22 @@ def generate_report(
     # ── 2. Replace provn_target section in coordination paragraph ────────────
     for para in doc.paragraphs:
         if 'coordination agreement with the concerned administrations' in para.text:
-            _replace_provn_section(para, history_data['provn_targets'])
+            _replace_provn_section(para, combined_provn_targets)
             break
 
     # ── 3. Replace table rows ─────────────────────────────────────────────────
     if doc.tables:
-        _replace_table_data(doc.tables[0], mdb_data, history_data)
+        _replace_table_data(doc.tables[0], notice_data_list)
 
-    # ── 4. Determine output filename ─────────────────────────────────────────
+    # ── 4. Update footer with document numbers ────────────────────────────────
+    _update_footer(doc, wm_num, d_num)
+
+    # ── 5. Determine output filename ─────────────────────────────────────────
     wm_part = wm_num  if wm_num  else 'xxxx'
     d_part  = d_num   if d_num   else 'xxxxx'
     filename = f'11.41B_WM{wm_part}_D{d_part}_Draft.docx'
 
-    # ── 5. Save to buffer and return ─────────────────────────────────────────
+    # ── 6. Save to buffer and return ─────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -449,13 +485,21 @@ def index():
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    notice_id    = (request.form.get('notice_id', '') or '').strip()
+    # Support both multi-select (getlist) and comma-separated text input
+    raw_ids    = request.form.getlist('notice_id')
+    notice_ids = []
+    for raw in raw_ids:
+        for nid in raw.split(','):
+            nid = nid.strip()
+            if nid:
+                notice_ids.append(nid)
+
     wm_num       = (request.form.get('wm_num', '')    or '').strip()
     d_num        = (request.form.get('d_num', '')     or '').strip()
     meeting_date = (request.form.get('meeting_date', '') or '').strip()
 
-    if not notice_id:
-        return jsonify({'error': 'Notice ID is required.'}), 400
+    if not notice_ids:
+        return jsonify({'error': 'At least one Notice ID is required.'}), 400
 
     # Default meeting date to today
     if not meeting_date:
@@ -463,7 +507,7 @@ def generate():
             else datetime.today().strftime('%#d %B %Y')
 
     try:
-        buf, filename = generate_report(notice_id, wm_num, d_num, meeting_date)
+        buf, filename = generate_report(notice_ids, wm_num, d_num, meeting_date)
     except FileNotFoundError as exc:
         return jsonify({'error': str(exc)}), 404
     except Exception as exc:
