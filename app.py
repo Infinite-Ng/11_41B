@@ -315,7 +315,7 @@ def _update_footer(doc, wm_num: str, d_num: str) -> None:
                 if wm_num:
                     t = re.sub(r'WM\d+', f'WM{wm_num}', t)
                 if d_num:
-                    t = re.sub(r'(?<![A-Za-z])D\d+', f'D{d_num}', t)
+                    t = re.sub(r'(?<![A-Za-z])D\s*\d+', f'D {d_num}', t)
                 run.text = t
 
 

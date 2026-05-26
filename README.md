@@ -68,7 +68,7 @@ After starting, open a browser and go to: **http://127.0.0.1:5050**
 
 1. 在浏览器中打开 `http://127.0.0.1:5050`。
 2. 页面会自动列出 `M:\BRSSD\CSS\11.41B\2026\` 下所有可用的通知 ID（含 `.mdb` 文件的文件夹）。
-3. 从下拉框中选择目标通知 ID。
+3. 从列表中选择一个或多个目标通知 ID（按住 **Ctrl** 可多选）；若无列表，可手动输入一个或多个 ID，逗号分隔。
 4. （可选）填写以下字段：
    - **会议编号（WM）**：如 `1668`；若留空，文件名中将使用 `xxxx`。
    - **文件编号（D）**：如 `72317`；若留空，文件名中将使用 `xxxxx`。
@@ -80,7 +80,7 @@ After starting, open a browser and go to: **http://127.0.0.1:5050**
 
 1. Open `http://127.0.0.1:5050` in a browser.
 2. The page will automatically list all available Notice IDs (folders containing a `.mdb` file) under `M:\BRSSD\CSS\11.41B\2026\`.
-3. Select the target Notice ID from the drop-down list.
+3. Select one or more Notice IDs from the list (hold **Ctrl** to multi-select); if no list appears, type one or more IDs separated by commas.
 4. (Optional) Fill in the following fields:
    - **Meeting No. (WM)**: e.g. `1668`; if blank, the filename will use `xxxx`.
    - **Document No. (D)**: e.g. `72317`; if blank, the filename will use `xxxxx`.
@@ -94,7 +94,7 @@ After starting, open a browser and go to: **http://127.0.0.1:5050**
 
 | 字段 / Field | 必填 / Required | 说明 / Description |
 |---|---|---|
-| 目标通知 ID / Target Notice ID | ✅ | 文件夹名称，如 `103500417` / Folder name, e.g. `103500417` |
+| 目标通知 ID / Target Notice ID | ✅ | 可多选；文件夹名称，如 `103500417`；无列表时输入逗号分隔的多个 ID / Multi-selectable; folder name e.g. `103500417`; comma-separated IDs when no list |
 | 会议编号（WM）/ Meeting No. (WM) | ❌ | 显示在标题中，如 `1668` → `1668th meeting` / Shown in heading |
 | 文件编号（D）/ Document No. (D) | ❌ | 显示在文件名中 / Used in filename |
 | 会议日期 / Meeting Date | ❌ | 显示在标题中，如 `4 June 2026` / Shown in heading |
@@ -112,7 +112,8 @@ The generated Word document contains the following updated content:
 | 文档标题 / Document heading | `{N}th meeting on {date}`（序数上角标）/ ordinal suffix is superscript |
 | 文件名 / Filename | `11.41B_WM{WM}_D{D}_Draft.docx` |
 | 正文第二段 / Body paragraph 2 | 条款编号（如 `No. 9.7 \|O\|`）替换为实际值，**黄色高亮** / provision numbers replaced with actual values, **yellow highlighted** |
-| 表格第一张 / Table 1 | 填入实际通知数据 / Filled with actual notice data |
+| 表格第一张 / Table 1 | 每条通知各自一行或多行；最后一列为该通知修改的条款 / One or more rows per notice; last column shows per-notice provisions |
+| 页脚文档编号 / Footer document No. | `D {D编号}`，与输入的文件编号一致 / `D {D number}`, matching the entered document number |
 
 **表格列映射 / Table Column Mapping**
 
@@ -124,7 +125,8 @@ The generated Word document contains the following updated content:
 | TYPE | `G` if `com_el.long_nom` has a value; `N` if empty |
 | Date of Receipt | `com_el.d_rcv`（格式 `DD.MM.YYYY`） |
 | ADM Coordination completed | `history_space` 文件中 `adm` 列的去重值 / Distinct `adm` values from `(history_space)` file |
-| 11.41 still exist | `YES` if `provn.agree_st` has any non-`O` value; `NO` if all are `O` |
+| 11.41 still exist | `provn.coord_prov` 中任一值包含 `11.41` 则为 `YES`，否则 `NO` / `YES` if any `provn.coord_prov` value contains `11.41` (e.g. `11.41`, `11.41/9.13`); `NO` otherwise |
+| Provision updated from 11.41\|X\| | `(history_space)` 文件中 `provn_target` 列去重值，格式 `No. X.Y \|O\|` / Distinct `provn_target` values formatted as `No. X.Y \|O\|` |
 
 ---
 
@@ -274,15 +276,25 @@ Locates the runs between `|X| to` and `or removed from` in the coordination para
 
 **Preserves the existing `rPr`** from the cloned template row (contains `minorHAnsi` theme font + 10 pt size), replacing only the text content.
 
-#### `_replace_table_data(table, mdb_data, history_data)`
+#### `_update_footer(doc, wm_num, d_num)`
+
+遍历所有 section 的页脚 run，用正则将 `D\s*\d+`（非字母前缀）替换为 `D {d_num}`，将 `WM\d+` 替换为 `WM{wm_num}`，保持页脚其他内容（如 `No.11.41B`、页码）不变。
+
+Iterates all section footer runs; uses regex to replace `D\s*\d+` (not preceded by a letter) with `D {d_num}` and `WM\d+` with `WM{wm_num}`, leaving the rest of the footer (e.g. `No.11.41B`, page number) unchanged.
+
+#### `_replace_table_data(table, notice_data_list)`
+
+接受 `(mdb_data, history_data)` 元组列表，每个 notice 的每条 `com_el` 记录输出一行，最后一列为该 notice 的条款列表（`No. X.Y |O|` 格式）。
+
+Accepts a list of `(mdb_data, history_data)` tuples; outputs one row per `com_el` record per notice, with the last column containing that notice's provision list (`No. X.Y |O|` format).
 
 1. 将第一个数据行的 XML 深拷贝为模板。
 2. 删除所有数据行（保留表头行）。
-3. 为 `com_el` 中的每条记录克隆该模板行并填入数据。
+3. 遍历所有 notice，为每条 `com_el` 记录克隆该模板行并填入数据（含最后一列条款）。
 
 1. Deep-copies the first data row's XML as a template.  
 2. Deletes all data rows (keeps header row 0).  
-3. Clones the template row for each `com_el` record and fills in the data.
+3. Iterates all notices; clones the template row for each `com_el` record, filling in data including the provision list in the last column.
 
 ---
 
