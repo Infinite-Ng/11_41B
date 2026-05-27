@@ -289,14 +289,21 @@ def get_capture_data(notice_id: str) -> dict:
         if row[0] is None:
             break
         raw_rev = row[reviewed_idx]
-        # openpyxl may deliver Excel booleans as Python True/False
+        # openpyxl may deliver: bool (Excel checkbox), int/float (numeric 1/0), or str
         if isinstance(raw_rev, bool):
-            is_yes = raw_rev
+            is_yes = raw_rev                          # True / False
+        elif isinstance(raw_rev, (int, float)):
+            is_yes = raw_rev != 0                     # 1 / 1.0 → Yes; 0 / 0.0 → No
         elif raw_rev is None:
             is_yes = False
         else:
             is_rev_str = str(raw_rev).strip().lower()
             is_yes = is_rev_str in {'yes', 'y', 'true', '-1', '1', 'oui', 'vrai', 'ja'}
+            if not is_yes:
+                app.logger.debug(
+                    'get_capture_data: unrecognised IsReviewed value %r (row col0=%r)',
+                    raw_rev, row[0]
+                )
         val13a = (str(row[col13a_idx]).strip() if row[col13a_idx] is not None else '')
         if not is_yes:
             all_reviewed = False
@@ -456,21 +463,43 @@ def _update_footer(doc, wm_num: str, d_num: str) -> None:
                         replaced = True
 
                 if not replaced:
-                    # Strategy B: split nodes e.g. 'D ' + '7' + '2317'
-                    # Find the w:t with 'D', set it to 'D {d_num}',
-                    # zero out all following digit-only nodes.
+                    # Strategy B: D-number spans multiple w:t nodes, e.g. 'D ' + '72317'
+                    # Write 'D {d_num}' to the D-prefix node AND copy the rPr
+                    # (including yellow highlight) from the first following digit node
+                    # so the merged text keeps its original formatting.
                     for i, t_elem in enumerate(t_elems):
                         curr = t_elem.text or ''
-                        if re.search(r'(?<![A-Za-z])D', curr):
-                            t_elem.text = re.sub(r'D\s*\d*', f'D {d_num}', curr)
-                            t_elem.set(f'{{{NS}}}space', 'preserve')
+                        if not re.search(r'(?<![A-Za-z])D', curr):
+                            continue
+                        t_elem.text = re.sub(r'D\s*\d*', f'D {d_num}', curr)
+                        t_elem.set(f'{{{NS}}}space', 'preserve')
+                        # Inherit rPr (incl. yellow) from the first non-empty digit run
+                        d_run = t_elem.getparent()
+                        if d_run is not None:
                             for j in range(i + 1, len(t_elems)):
                                 nxt = t_elems[j].text or ''
-                                if re.fullmatch(r'[\d\s]*', nxt):
-                                    t_elems[j].text = ''
-                                else:
+                                if not re.fullmatch(r'[\d\s]*', nxt):
                                     break
-                            break
+                                if not nxt.strip():
+                                    continue  # skip empty intermediary nodes
+                                digit_run = t_elems[j].getparent()
+                                if digit_run is None:
+                                    break
+                                digit_rPr = digit_run.find(f'{{{W}}}rPr')
+                                if digit_rPr is not None:
+                                    old_rPr = d_run.find(f'{{{W}}}rPr')
+                                    if old_rPr is not None:
+                                        d_run.remove(old_rPr)
+                                    d_run.insert(0, copy.deepcopy(digit_rPr))
+                                break
+                        # Zero out all following digit nodes
+                        for j in range(i + 1, len(t_elems)):
+                            nxt = t_elems[j].text or ''
+                            if re.fullmatch(r'[\d\s]*', nxt):
+                                t_elems[j].text = ''
+                            else:
+                                break
+                        break
 
 
 def _update_signoff_date(doc, date_str: str) -> None:
@@ -804,12 +833,40 @@ def debug_capture(notice_id):
         if matches:
             result['capture_file'] = os.path.basename(matches[0])
             try:
-                wb = openpyxl.load_workbook(matches[0], read_only=True)
-                ws = wb.active
-                result['headers_row1'] = [
+                wb   = openpyxl.load_workbook(matches[0], read_only=True)
+                ws   = wb.active
+                hdrs = [
                     (str(h).strip() if h is not None else '<empty>')
                     for h in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
                 ]
+                result['headers_row1'] = hdrs
+
+                # Find IsReviewed and 13A column indices (same logic as get_capture_data)
+                def _find(candidates):
+                    for name in candidates:
+                        for i, h in enumerate(hdrs):
+                            if h.lower() == name.lower():
+                                return i
+                    for name in candidates:
+                        for i, h in enumerate(hdrs):
+                            if name.lower() in h.lower() or h.lower() in name.lower():
+                                return i
+                    return -1
+
+                rev_idx  = _find(['IsReviewed', 'Is Reviewed', 'Reviewed', 'reviewed'])
+                a13_idx  = _find(['13 A', '13A', '13a', '13 a', 'ART13A', 'Art13A'])
+                result['isreviewed_col_idx'] = rev_idx
+                result['13a_col_idx']        = a13_idx
+
+                # First 5 data rows with repr() of each value for easy debugging
+                sample = []
+                for row in ws.iter_rows(min_row=2, max_row=6, values_only=True):
+                    sample.append({
+                        'col0':        repr(row[0]),
+                        'IsReviewed':  repr(row[rev_idx])  if rev_idx >= 0  else 'N/A',
+                        '13A':         repr(row[a13_idx])  if a13_idx >= 0  else 'N/A',
+                    })
+                result['data_rows_sample'] = sample
                 wb.close()
             except Exception as exc:  # pylint: disable=broad-except
                 result['error'] = str(exc)

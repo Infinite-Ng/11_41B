@@ -149,6 +149,43 @@ class TestUpdateFooter:
         # Original fragments must be gone
         assert '2317' not in text
 
+    def test_split_nodes_yellow_preserved(self):
+        """Strategy B must copy yellow rPr from the digit run to the D-prefix run."""
+        doc = Document()
+        doc.sections[0].footer.is_linked_to_previous = False
+        ftr = doc.sections[0].footer._element
+        # Run 1: 'D ' – no highlight
+        p    = OxmlElement('w:p')
+        r1   = OxmlElement('w:r')
+        t1   = OxmlElement('w:t')
+        t1.text = 'D '
+        t1.set(f'{{{NS}}}space', 'preserve')
+        r1.append(t1)
+        # Run 2: '72317' – yellow highlight in rPr
+        r2   = OxmlElement('w:r')
+        rPr2 = OxmlElement('w:rPr')
+        hl2  = OxmlElement('w:highlight')
+        hl2.set(qn('w:val'), 'yellow')
+        rPr2.append(hl2)
+        r2.append(rPr2)
+        t2   = OxmlElement('w:t')
+        t2.text = '72317'
+        r2.append(t2)
+        p.append(r1)
+        p.append(r2)
+        ftr.append(p)
+
+        _update_footer(doc, '1668', '88888')
+
+        # The D-prefix run (r1) should now carry yellow highlight
+        rPr1 = r1.find(f'{{{W}}}rPr')
+        assert rPr1 is not None, 'D-prefix run has no rPr after Strategy B'
+        hl   = rPr1.find(f'{{{W}}}highlight')
+        assert hl is not None, 'D-prefix run has no highlight element'
+        assert hl.get(qn('w:val')) == 'yellow'
+        # Text must be correct
+        assert _footer_all_text(doc).replace(' ', '') == 'D88888'
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sign-off date update (Bug 2)
