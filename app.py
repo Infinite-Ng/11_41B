@@ -210,6 +210,80 @@ def get_history_data(notice_id: str) -> dict:
         'adms':          sorted(adms),
     }
 
+def get_capture_data(notice_id: str) -> dict:
+    """
+    Find *(capture_space).xlsx in the Status Review folder and extract:
+      findings_review:    'YES' if any IsReviewed=Yes row has a non-ANN 13A value;
+                          'NO' if all IsReviewed=Yes rows have 13A=ANN (or no Yes rows)
+      still_exist_suffix: letter (A/B) + digit (1/2/3)
+        A = ALL rows are IsReviewed=Yes; B = at least one is not Yes
+        1 = no Yes-row has 13A=ANN; 2 = mixed; 3 = all Yes-rows have 13A=ANN
+    Returns empty strings for both fields if the file is not found.
+    """
+    status_dir = os.path.join(BASE_DIR, 'BR_TEXT_RESULTS', notice_id, 'Status Review')
+    matches    = glob.glob(os.path.join(status_dir, '*(capture_space).*'))
+    if not matches:
+        return {'findings_review': '', 'still_exist_suffix': ''}
+
+    wb = openpyxl.load_workbook(matches[0], read_only=True)
+    ws = wb.active
+
+    headers = [
+        (str(h).strip() if h is not None else '')
+        for h in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    ]
+
+    def find_col(*candidates):
+        for name in candidates:
+            try:
+                return headers.index(name)
+            except ValueError:
+                pass
+        return -1
+
+    reviewed_idx = find_col('IsReviewed', 'Is Reviewed')
+    col13a_idx   = find_col('13 A', '13A', '13a', '13 a')
+
+    if reviewed_idx == -1 or col13a_idx == -1:
+        wb.close()
+        return {'findings_review': '', 'still_exist_suffix': ''}
+
+    all_reviewed      = True
+    reviewed_13a_vals = []
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0] is None:
+            break
+        is_rev = (str(row[reviewed_idx]).strip() if row[reviewed_idx] is not None else '').lower()
+        val13a = (str(row[col13a_idx]).strip()   if row[col13a_idx]   is not None else '')
+        if is_rev != 'yes':
+            all_reviewed = False
+        else:
+            reviewed_13a_vals.append(val13a)
+
+    wb.close()
+
+    letter = 'A' if all_reviewed else 'B'
+
+    if not reviewed_13a_vals:
+        number = ''
+    else:
+        ann_count     = sum(1 for v in reviewed_13a_vals if v.upper() == 'ANN')
+        non_ann_count = len(reviewed_13a_vals) - ann_count
+        if ann_count == 0:
+            number = '1'      # no Yes-row has 13A=ANN
+        elif non_ann_count == 0:
+            number = '3'      # all Yes-rows have 13A=ANN
+        else:
+            number = '2'      # mixed
+
+    findings_review = (
+        'YES' if any(v.upper() != 'ANN' for v in reviewed_13a_vals) else 'NO'
+    )
+    return {
+        'findings_review':    findings_review,
+        'still_exist_suffix': f'{letter}{number}',
+    }
 
 # ── Document builders ─────────────────────────────────────────────────────────
 
@@ -304,26 +378,45 @@ def _replace_provn_section(para, provn_targets: list) -> None:
 
 def _update_footer(doc, wm_num: str, d_num: str) -> None:
     """
-    Update document number occurrences in all section footers.
-    Replaces 'WM<digits>' with 'WM<wm_num>' and standalone 'D<digits>'
-    (not preceded by a letter) with 'D<d_num>' in each footer run.
+    Update the 'D <number>' document reference in all section footers.
+    Replaces 'D<optional-space><digits>' (not preceded by a letter) with
+    'D {d_num}'. Other footer content (No.11.41B, page number) is unchanged.
     """
     for section in doc.sections:
         for para in section.footer.paragraphs:
             for run in para.runs:
                 t = run.text
-                if wm_num:
-                    t = re.sub(r'WM\d+', f'WM{wm_num}', t)
                 if d_num:
                     t = re.sub(r'(?<![A-Za-z])D\s*\d+', f'D {d_num}', t)
                 run.text = t
 
 
-def _set_cell_text(cell, text: str) -> None:
+def _update_signoff_date(doc, date_str: str) -> None:
+    """
+    Find the last date-pattern paragraph in the document body and replace
+    its date with date_str (e.g. '27 May 2026').
+    Searches paragraphs from the end to catch the sign-off date.
+    """
+    date_re = re.compile(
+        r'\b\d{1,2}\s+(?:January|February|March|April|May|June|July|'
+        r'August|September|October|November|December)\s+\d{4}\b',
+        re.IGNORECASE,
+    )
+    for para in reversed(doc.paragraphs):
+        if date_re.search(para.text):
+            for run in para.runs:
+                if date_re.search(run.text):
+                    run.text = date_re.sub(date_str, run.text)
+            break
+
+
+def _set_cell_text(cell, text: str, force_calibri: bool = False) -> None:
     """
     Clear a table cell and set plain text.
     Preserves the run properties (rPr) from the cloned template row so that
-    font (Calibri via minorHAnsi theme) and size (10 pt) are maintained.
+    font and size are maintained.
+    Pass force_calibri=True to override rFonts with explicit Calibri
+    (used for the 'Provision updated from 11.41|X|' column).
     """
     para   = cell.paragraphs[0]
     W      = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -345,10 +438,19 @@ def _set_cell_text(cell, text: str) -> None:
     # Build a new run
     r = OxmlElement('w:r')
     if existing_rPr is not None:
-        # Re-use the cloned rPr (preserves theme font + size from template)
-        r.append(existing_rPr)
+        rPr_to_use = existing_rPr
+        if force_calibri:
+            # Replace any existing rFonts with explicit Calibri
+            for rf in list(rPr_to_use.findall(f'{{{W}}}rFonts')):
+                rPr_to_use.remove(rf)
+            rFonts = OxmlElement('w:rFonts')
+            rFonts.set(qn('w:ascii'), 'Calibri')
+            rFonts.set(qn('w:hAnsi'), 'Calibri')
+            rFonts.set(qn('w:cs'),    'Calibri')
+            rPr_to_use.insert(0, rFonts)
+        r.append(rPr_to_use)
     else:
-        # Fallback: set Calibri explicitly
+        # Fallback: always explicit Calibri
         rPr    = OxmlElement('w:rPr')
         rFonts = OxmlElement('w:rFonts')
         rFonts.set(qn('w:ascii'), 'Calibri')
@@ -365,11 +467,53 @@ def _set_cell_text(cell, text: str) -> None:
     p_elem.append(r)
 
 
+def _set_cell_still_exist(cell, main_text: str, suffix: str) -> None:
+    """
+    Set a table cell to main_text with a superscript suffix.
+    E.g. main_text='YES', suffix='A3' produces 'YES' + superscript 'A3'.
+    Both runs preserve the template row's rPr (font + size).
+    """
+    para   = cell.paragraphs[0]
+    W      = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    p_elem = para._p
+
+    existing_runs = p_elem.findall(f'{{{W}}}r')
+    base_rPr = None
+    if existing_runs:
+        rPr_list = existing_runs[0].findall(f'{{{W}}}rPr')
+        if rPr_list:
+            base_rPr = copy.deepcopy(rPr_list[0])
+    for r in existing_runs:
+        p_elem.remove(r)
+
+    # Run 1: main text
+    r1 = OxmlElement('w:r')
+    if base_rPr is not None:
+        r1.append(copy.deepcopy(base_rPr))
+    t1 = OxmlElement('w:t')
+    t1.text = main_text
+    r1.append(t1)
+    p_elem.append(r1)
+
+    # Run 2: superscript suffix
+    if suffix:
+        r2   = OxmlElement('w:r')
+        rPr2 = copy.deepcopy(base_rPr) if base_rPr is not None else OxmlElement('w:rPr')
+        va   = OxmlElement('w:vertAlign')
+        va.set(qn('w:val'), 'superscript')
+        rPr2.append(va)
+        r2.append(rPr2)
+        t2 = OxmlElement('w:t')
+        t2.text = suffix
+        r2.append(t2)
+        p_elem.append(r2)
+
+
 def _replace_table_data(table, notice_data_list: list) -> None:
     """
     Remove all sample data rows (row index >= 1) and add one row per com_el
     record across all notices, cloning the first data row's XML for formatting.
-    notice_data_list: list of (mdb_data, history_data) tuples.
+    notice_data_list: list of (mdb_data, history_data, capture_data) tuples.
     """
     # Save the first data row as formatting template (before deletion)
     template_tr = None
@@ -380,11 +524,13 @@ def _replace_table_data(table, notice_data_list: list) -> None:
     while len(table.rows) > 1:
         table._tbl.remove(table.rows[1]._tr)
 
-    for mdb_data, history_data in notice_data_list:
-        adm_coord = ', '.join(history_data['adms'])
-        provn_col = ', '.join(
+    for mdb_data, history_data, capture_data in notice_data_list:
+        adm_coord          = ', '.join(history_data['adms'])
+        provn_col          = ', '.join(
             f'No. {pt} |O|' for pt in history_data['provn_targets']
         )
+        findings_review    = capture_data.get('findings_review', '')
+        still_exist_suffix = capture_data.get('still_exist_suffix', '')
 
         for record in mdb_data['com_el']:
             # Clone template row or add a new one
@@ -395,21 +541,31 @@ def _replace_table_data(table, notice_data_list: list) -> None:
             else:
                 new_row = table.add_row()
 
-            values = [
-                record['ntc_id'],        # Notice ID
-                record['adm'],           # ADM
-                record['sat_name'],      # STATION
-                record['type'],          # TYPE (G/N)
-                record['d_rcv'],         # Date of Receipt
-                adm_coord,               # ADM Coordination completed
-                '',                      # ADM Coordination no longer required
-                '',                      # Findings review required (13A)
-                mdb_data['still_exist'], # 11.41 still exist
-                provn_col,               # Provision updated from 11.41|X|
+            cells = new_row.cells
+            n     = len(cells)
+
+            # Columns 0–7: plain text, preserving template font
+            plain_vals = [
+                record['ntc_id'],   # 0 Notice ID
+                record['adm'],      # 1 ADM
+                record['sat_name'], # 2 STATION
+                record['type'],     # 3 TYPE (G/N)
+                record['d_rcv'],    # 4 Date of Receipt
+                adm_coord,          # 5 ADM Coordination completed
+                '',                 # 6 ADM Coordination no longer required
+                findings_review,    # 7 Findings review required (13A)
             ]
-            for i, val in enumerate(values):
-                if i < len(new_row.cells):
-                    _set_cell_text(new_row.cells[i], val)
+            for i, val in enumerate(plain_vals):
+                if i < n:
+                    _set_cell_text(cells[i], val)
+
+            # Column 8: 11.41 still exist + superscript footnote marker
+            if 8 < n:
+                _set_cell_still_exist(cells[8], mdb_data['still_exist'], still_exist_suffix)
+
+            # Column 9: Provision updated from 11.41|X| – explicit Calibri
+            if 9 < n:
+                _set_cell_text(cells[9], provn_col, force_calibri=True)
 
 
 def generate_report(
@@ -429,7 +585,8 @@ def generate_report(
     for notice_id in notice_ids:
         mdb_data     = get_mdb_data(notice_id)
         history_data = get_history_data(notice_id)
-        notice_data_list.append((mdb_data, history_data))
+        capture_data = get_capture_data(notice_id)
+        notice_data_list.append((mdb_data, history_data, capture_data))
         all_provn_targets.update(history_data['provn_targets'])
 
     combined_provn_targets = sorted(all_provn_targets, key=_numeric_key)
@@ -456,12 +613,19 @@ def generate_report(
     # ── 4. Update footer with document numbers ────────────────────────────────
     _update_footer(doc, wm_num, d_num)
 
-    # ── 5. Determine output filename ─────────────────────────────────────────
+    # ── 5. Update sign-off date ───────────────────────────────────────────────
+    today_str = (
+        datetime.today().strftime('%#d %B %Y') if os.name == 'nt'
+        else datetime.today().strftime('%-d %B %Y')
+    )
+    _update_signoff_date(doc, today_str)
+
+    # ── 6. Determine output filename ─────────────────────────────────────────
     wm_part = wm_num  if wm_num  else 'xxxx'
     d_part  = d_num   if d_num   else 'xxxxx'
     filename = f'11.41B_WM{wm_part}_D{d_part}_Draft.docx'
 
-    # ── 6. Save to buffer and return ─────────────────────────────────────────
+    # ── 7. Save to buffer and return ─────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
