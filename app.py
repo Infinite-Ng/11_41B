@@ -52,6 +52,7 @@ def _make_run_xml(
     superscript: bool = False,
     font_name: str = 'Calibri',
     sz_cs: int = 22,
+    clear_highlight: bool = False,
 ) -> object:
     """
     Create a ``w:r`` OxmlElement.
@@ -81,10 +82,14 @@ def _make_run_xml(
         va.set(qn('w:val'), 'superscript')
         rPr.append(va)
 
-    # Highlight
+    # Highlight (or explicit clear to override paragraph/character style)
     if highlight:
         hl = OxmlElement('w:highlight')
         hl.set(qn('w:val'), highlight)
+        rPr.append(hl)
+    elif clear_highlight:
+        hl = OxmlElement('w:highlight')
+        hl.set(qn('w:val'), 'none')
         rPr.append(hl)
 
     # Complex-script size (matches template's szCs val="22")
@@ -315,9 +320,10 @@ def _update_meeting_para(para, wm_num: str, meeting_date: str) -> None:
     W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     p_elem = para._p
 
-    # Remove all existing w:r elements
-    for r in list(p_elem.findall(f'{{{W}}}r')):
-        p_elem.remove(r)
+    # Remove ALL content except w:pPr (handles w:r, w:sdt, w:hyperlink, etc.)
+    for child in list(p_elem):
+        if child.tag != f'{{{W}}}pPr':
+            p_elem.remove(child)
 
     # Determine the ordinal suffix
     try:
@@ -328,17 +334,17 @@ def _update_meeting_para(para, wm_num: str, meeting_date: str) -> None:
         suffix  = 'th'
         num_str = str(wm_num) if wm_num else 'xxxx'
 
-    # Run 1 – 'Presented at the <number>' (bold)
+    # Run 1 – 'Presented at the <number>' (bold, yellow highlight cleared)
     p_elem.append(_make_run_xml(
-        f'Presented at the {num_str}', bold=True
+        f'Presented at the {num_str}', bold=True, clear_highlight=True
     ))
-    # Run 2 – superscript ordinal suffix (bold + superscript)
+    # Run 2 – superscript ordinal suffix (bold + superscript, highlight cleared)
     p_elem.append(_make_run_xml(
-        suffix, bold=True, superscript=True
+        suffix, bold=True, superscript=True, clear_highlight=True
     ))
-    # Run 3 – rest of the heading (bold)
+    # Run 3 – rest of the heading (bold, highlight cleared)
     p_elem.append(_make_run_xml(
-        f' meeting on {meeting_date}', bold=True
+        f' meeting on {meeting_date}', bold=True, clear_highlight=True
     ))
 
 
@@ -414,11 +420,37 @@ def _update_footer(doc, wm_num: str, d_num: str) -> None:
                 continue
             if ftr_elem is None:
                 continue
-            for t_elem in ftr_elem.iter(f'{{{W}}}t'):
-                text = t_elem.text or ''
-                if d_re.search(text):
-                    t_elem.text = d_re.sub(f'D {d_num}', text)
-                    t_elem.set(f'{{{NS}}}space', 'preserve')
+            for p_elem in ftr_elem.iter(f'{{{W}}}p'):
+                t_elems = list(p_elem.iter(f'{{{W}}}t'))
+                p_text  = ''.join(t.text or '' for t in t_elems)
+                if not d_re.search(p_text):
+                    continue
+
+                # Strategy A: single w:t contains the whole D-pattern
+                replaced = False
+                for t_elem in t_elems:
+                    text = t_elem.text or ''
+                    if d_re.search(text):
+                        t_elem.text = d_re.sub(f'D {d_num}', text)
+                        t_elem.set(f'{{{NS}}}space', 'preserve')
+                        replaced = True
+
+                if not replaced:
+                    # Strategy B: split nodes e.g. 'D ' + '7' + '2317'
+                    # Find the w:t with 'D', set it to 'D {d_num}',
+                    # zero out all following digit-only nodes.
+                    for i, t_elem in enumerate(t_elems):
+                        curr = t_elem.text or ''
+                        if re.search(r'(?<![A-Za-z])D', curr):
+                            t_elem.text = re.sub(r'D\s*\d*', f'D {d_num}', curr)
+                            t_elem.set(f'{{{NS}}}space', 'preserve')
+                            for j in range(i + 1, len(t_elems)):
+                                nxt = t_elems[j].text or ''
+                                if re.fullmatch(r'[\d\s]*', nxt):
+                                    t_elems[j].text = ''
+                                else:
+                                    break
+                            break
 
 
 def _update_signoff_date(doc, date_str: str) -> None:
@@ -428,21 +460,32 @@ def _update_signoff_date(doc, date_str: str) -> None:
     Uses a two-pass strategy: per-run first; if the date spans multiple
     runs it merges them into one new run.
     """
+    # Match both English ('27 May 2026') and DD.MM.YYYY ('23.09.2025') formats
     date_re = re.compile(
         r'\b\d{1,2}\s+(?:January|February|March|April|May|June|July|'
-        r'August|September|October|November|December)\s+\d{4}\b',
+        r'August|September|October|November|December)\s+\d{4}\b'
+        r'|\b\d{2}[.]\d{2}[.]\d{4}\b',
         re.IGNORECASE,
     )
-    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    W  = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    NS = 'http://www.w3.org/XML/1998/namespace'
     for para in reversed(list(_all_doc_paragraphs(doc))):
         full_text = para.text
         if not date_re.search(full_text):
             continue
-        # Pass 1: per-run replacement
+        # Pass 1: per-run replacement + strip yellow highlight
         replaced = False
         for run in para.runs:
             if date_re.search(run.text):
                 run.text = date_re.sub(date_str, run.text)
+                r_elem = run._r
+                rPr_el = r_elem.find(f'{{{W}}}rPr')
+                if rPr_el is not None:
+                    for hl in list(rPr_el.findall(f'{{{W}}}highlight')):
+                        rPr_el.remove(hl)
+                    hl_none = OxmlElement('w:highlight')
+                    hl_none.set(qn('w:val'), 'none')
+                    rPr_el.append(hl_none)
                 replaced = True
         if not replaced:
             # Pass 2: date spans runs – merge all runs into one
@@ -457,10 +500,16 @@ def _update_signoff_date(doc, date_str: str) -> None:
                 p_elem.remove(r)
             new_run = OxmlElement('w:r')
             if base_rPr is not None:
+                # Strip yellow highlight before reusing rPr
+                for hl in list(base_rPr.findall(f'{{{W}}}highlight')):
+                    base_rPr.remove(hl)
+                hl_none = OxmlElement('w:highlight')
+                hl_none.set(qn('w:val'), 'none')
+                base_rPr.append(hl_none)
                 new_run.append(base_rPr)
             t = OxmlElement('w:t')
             t.text = date_re.sub(date_str, full_text)
-            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.set(f'{{{NS}}}space', 'preserve')
             new_run.append(t)
             p_elem.append(new_run)
         break
@@ -678,11 +727,8 @@ def generate_report(
     # ── 4. Update footer with document numbers ────────────────────────────────
     _update_footer(doc, wm_num, d_num)
 
-    # ── 5. Update sign-off date ───────────────────────────────────────────────
-    today_str = (
-        datetime.today().strftime('%#d %B %Y') if os.name == 'nt'
-        else datetime.today().strftime('%-d %B %Y')
-    )
+    # ── 5. Update sign-off date (DD.MM.YYYY to match the ITU template format) ─
+    today_str = datetime.today().strftime('%d.%m.%Y')
     _update_signoff_date(doc, today_str)
 
     # ── 6. Determine output filename ─────────────────────────────────────────

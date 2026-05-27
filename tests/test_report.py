@@ -127,6 +127,28 @@ class TestUpdateFooter:
         assert 'ADMIN'   in text
         assert 'D 00001' in text
 
+    def test_split_nodes_updated(self):
+        """Real ITU template bug: footer has 'D '+'7'+'2317' as 3 separate w:t nodes."""
+        doc = Document()
+        doc.sections[0].footer.is_linked_to_previous = False
+        ftr = doc.sections[0].footer._element
+        # Build a paragraph with 3 separate runs / text nodes
+        p = OxmlElement('w:p')
+        for chunk in ('D ', '7', '2317'):
+            r = OxmlElement('w:r')
+            t = OxmlElement('w:t')
+            t.text = chunk
+            t.set(f'{{{NS}}}space', 'preserve')
+            r.append(t)
+            p.append(r)
+        ftr.append(p)
+
+        _update_footer(doc, '1668', '88888')
+        text = _footer_all_text(doc)
+        assert 'D 88888' in text
+        # Original fragments must be gone
+        assert '2317' not in text
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sign-off date update (Bug 2)
@@ -171,6 +193,34 @@ class TestUpdateSignoffDate:
         doc.add_paragraph('No date here')
         _update_signoff_date(doc, '1 June 2026')
         assert 'No date here' in doc.paragraphs[-1].text
+
+    def test_dd_mm_yyyy_format(self):
+        """ITU templates use DD.MM.YYYY (e.g. '23.09.2025') for sign-off date."""
+        doc = _make_doc_date_para(['23.09.2025'])
+        _update_signoff_date(doc, '27.05.2026')
+        assert '27.05.2026' in doc.paragraphs[-1].text
+        assert '23.09.2025' not in doc.paragraphs[-1].text
+
+    def test_yellow_highlight_cleared_single_run(self):
+        """Yellow highlight placeholder styling must be removed after replacement."""
+        doc  = Document()
+        para = doc.add_paragraph()
+        run  = para.add_run('23.09.2025')
+        # Manually add yellow highlight to simulate template placeholder
+        rPr_el = OxmlElement('w:rPr')
+        hl = OxmlElement('w:highlight')
+        hl.set(qn('w:val'), 'yellow')
+        rPr_el.append(hl)
+        run._r.insert(0, rPr_el)
+
+        _update_signoff_date(doc, '27.05.2026')
+
+        # The run's highlight should now be 'none' (not 'yellow')
+        r_elem = para.runs[-1]._r
+        rPr = r_elem.find(f'{{{W}}}rPr')
+        hl_elem = rPr.find(f'{{{W}}}highlight') if rPr is not None else None
+        if hl_elem is not None:
+            assert hl_elem.get(qn('w:val')) == 'none'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,3 +345,74 @@ class TestUpdateMeetingParaBody:
 
         assert '4 June 2026' in cell.paragraphs[0].text
         assert '1 January 2026' not in cell.paragraphs[0].text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _make_run_xml – clear_highlight param (new structural fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMakeRunXml:
+
+    def test_clear_highlight_adds_none(self):
+        """clear_highlight=True must insert <w:highlight val='none'/> in rPr."""
+        r = _make_run_xml('test', clear_highlight=True)
+        rPr = r.find(f'{{{W}}}rPr')
+        assert rPr is not None
+        hl = rPr.find(f'{{{W}}}highlight')
+        assert hl is not None, 'no highlight element found'
+        assert hl.get(qn('w:val')) == 'none'
+
+    def test_highlight_and_clear_mutually_exclusive(self):
+        """When both highlight and clear_highlight are given, highlight wins."""
+        r = _make_run_xml('test', highlight='yellow', clear_highlight=True)
+        rPr = r.find(f'{{{W}}}rPr')
+        hl = rPr.find(f'{{{W}}}highlight')
+        assert hl is not None
+        assert hl.get(qn('w:val')) == 'yellow'
+
+    def test_no_highlight_elem_by_default(self):
+        """With neither flag set, no highlight element is created."""
+        r = _make_run_xml('test')
+        rPr = r.find(f'{{{W}}}rPr')
+        assert rPr is not None
+        assert rPr.find(f'{{{W}}}highlight') is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _update_meeting_para – clear_highlight on runs (new structural fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUpdateMeetingParaClearHighlight:
+
+    def test_runs_have_no_yellow_highlight(self):
+        """After _update_meeting_para, no created run should have yellow highlight."""
+        doc  = Document()
+        para = doc.add_paragraph()
+        para.add_run(MTG_TEXT)
+        _update_meeting_para(para, '1668', '4 June 2026')
+        p_elem = para._p
+        for r_elem in p_elem.findall(f'{{{W}}}r'):
+            rPr = r_elem.find(f'{{{W}}}rPr')
+            if rPr is not None:
+                hl = rPr.find(f'{{{W}}}highlight')
+                if hl is not None:
+                    assert hl.get(qn('w:val')) != 'yellow', \
+                        'yellow highlight still present on a run after update'
+
+    def test_non_r_elements_removed(self):
+        """All non-pPr children (e.g. custom XML, SDT) must be removed, not only w:r."""
+        doc  = Document()
+        para = doc.add_paragraph()
+        # Inject a fake non-w:r element (w:bookmarkStart used as a stand-in)
+        bk = OxmlElement('w:bookmarkStart')
+        bk.set(qn('w:id'), '99')
+        bk.set(qn('w:name'), '_GoBack')
+        para._p.append(bk)
+        para.add_run(MTG_TEXT)
+        _update_meeting_para(para, '1668', '4 June 2026')
+        # After update, only w:pPr and w:r children should remain
+        W_local = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        for child in para._p:
+            assert child.tag in (f'{{{W_local}}}pPr', f'{{{W_local}}}r'), \
+                f'unexpected child tag after update: {child.tag}'
+
