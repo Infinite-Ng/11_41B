@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.docx
+!*sample*.docx
+*.log
+.env
