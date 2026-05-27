@@ -288,9 +288,17 @@ def get_capture_data(notice_id: str) -> dict:
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row[0] is None:
             break
-        is_rev = (str(row[reviewed_idx]).strip() if row[reviewed_idx] is not None else '').lower()
-        val13a = (str(row[col13a_idx]).strip()   if row[col13a_idx]   is not None else '')
-        if is_rev != 'yes':
+        raw_rev = row[reviewed_idx]
+        # openpyxl may deliver Excel booleans as Python True/False
+        if isinstance(raw_rev, bool):
+            is_yes = raw_rev
+        elif raw_rev is None:
+            is_yes = False
+        else:
+            is_rev_str = str(raw_rev).strip().lower()
+            is_yes = is_rev_str in {'yes', 'y', 'true', '-1', '1', 'oui', 'vrai', 'ja'}
+        val13a = (str(row[col13a_idx]).strip() if row[col13a_idx] is not None else '')
+        if not is_yes:
             all_reviewed = False
         else:
             reviewed_13a_vals.append(val13a)
@@ -346,17 +354,17 @@ def _update_meeting_para(para, wm_num: str, meeting_date: str) -> None:
         suffix  = 'th'
         num_str = str(wm_num) if wm_num else 'xxxx'
 
-    # Run 1 – 'Presented at the <number>' (bold)
+    # Run 1 – 'Presented at the <number>' (bold, yellow for engineer review)
     p_elem.append(_make_run_xml(
-        f'Presented at the {num_str}', bold=True
+        f'Presented at the {num_str}', bold=True, highlight='yellow'
     ))
-    # Run 2 – superscript ordinal suffix (bold + superscript)
+    # Run 2 – superscript ordinal suffix (bold + superscript, yellow)
     p_elem.append(_make_run_xml(
-        suffix, bold=True, superscript=True
+        suffix, bold=True, superscript=True, highlight='yellow'
     ))
-    # Run 3 – rest of the heading (bold)
+    # Run 3 – rest of the heading (bold, yellow for engineer review)
     p_elem.append(_make_run_xml(
-        f' meeting on {meeting_date}', bold=True
+        f' meeting on {meeting_date}', bold=True, highlight='yellow'
     ))
 
 
@@ -515,45 +523,46 @@ def _update_signoff_date(doc, date_str: str) -> None:
 
 def _set_cell_text(cell, text: str, force_calibri: bool = False) -> None:
     """
-    Clear a table cell and set plain text.
-    Preserves the run properties (rPr) from the cloned template row so that
-    font and size are maintained.
-    Pass force_calibri=True to override rFonts with explicit Calibri
-    (used for the 'Provision updated from 11.41|X|' column).
+    Set a table cell's plain text, updating the first existing run IN-PLACE so
+    all original run formatting (including yellow highlight) is preserved.
+    Extra runs are removed.  Pass force_calibri=True to override the font.
     """
     para   = cell.paragraphs[0]
     W      = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    NS     = 'http://www.w3.org/XML/1998/namespace'
     p_elem = para._p
 
     existing_runs = p_elem.findall(f'{{{W}}}r')
 
-    # Capture run properties from the first existing run
-    existing_rPr = None
     if existing_runs:
-        rPr_list = existing_runs[0].findall(f'{{{W}}}rPr')
-        if rPr_list:
-            existing_rPr = copy.deepcopy(rPr_list[0])
-
-    # Remove all existing runs
-    for r in existing_runs:
-        p_elem.remove(r)
-
-    # Build a new run
-    r = OxmlElement('w:r')
-    if existing_rPr is not None:
-        rPr_to_use = existing_rPr
+        # Keep the first run intact (preserves rPr, including yellow highlight)
+        run = existing_runs[0]
+        for spare in existing_runs[1:]:
+            p_elem.remove(spare)
+        # Replace all w:t nodes with a single updated one
+        for t_elem in run.findall(f'{{{W}}}t'):
+            run.remove(t_elem)
+        t = OxmlElement('w:t')
+        t.text = text
+        if text != text.strip() or not text:
+            t.set(f'{{{NS}}}space', 'preserve')
+        run.append(t)
+        # Optionally override font
         if force_calibri:
-            # Replace any existing rFonts with explicit Calibri
-            for rf in list(rPr_to_use.findall(f'{{{W}}}rFonts')):
-                rPr_to_use.remove(rf)
+            rPr = run.find(f'{{{W}}}rPr')
+            if rPr is None:
+                rPr = OxmlElement('w:rPr')
+                run.insert(0, rPr)
+            for rf in list(rPr.findall(f'{{{W}}}rFonts')):
+                rPr.remove(rf)
             rFonts = OxmlElement('w:rFonts')
             rFonts.set(qn('w:ascii'), 'Calibri')
             rFonts.set(qn('w:hAnsi'), 'Calibri')
             rFonts.set(qn('w:cs'),    'Calibri')
-            rPr_to_use.insert(0, rFonts)
-        r.append(rPr_to_use)
+            rPr.insert(0, rFonts)
     else:
-        # Fallback: always explicit Calibri
+        # Fallback: cell has no runs yet – build one with explicit Calibri
+        r      = OxmlElement('w:r')
         rPr    = OxmlElement('w:rPr')
         rFonts = OxmlElement('w:rFonts')
         rFonts.set(qn('w:ascii'), 'Calibri')
@@ -561,61 +570,73 @@ def _set_cell_text(cell, text: str, force_calibri: bool = False) -> None:
         rFonts.set(qn('w:cs'),    'Calibri')
         rPr.append(rFonts)
         r.append(rPr)
-
-    t = OxmlElement('w:t')
-    t.text = text
-    if text != text.strip():
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-    r.append(t)
-    p_elem.append(r)
+        t = OxmlElement('w:t')
+        t.text = text
+        if text != text.strip() or not text:
+            t.set(f'{{{NS}}}space', 'preserve')
+        r.append(t)
+        p_elem.append(r)
 
 
 def _set_cell_still_exist(cell, main_text: str, suffix: str) -> None:
     """
     Set a table cell to main_text with a superscript suffix.
     E.g. main_text='YES', suffix='A3' produces 'YES' + superscript 'A3'.
-    Both runs preserve the template row's rPr (font + size).
+    The main-text run is updated IN-PLACE to preserve all template formatting
+    (including yellow highlight).  The superscript run is appended as new.
     """
     para   = cell.paragraphs[0]
     W      = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     p_elem = para._p
 
     existing_runs = p_elem.findall(f'{{{W}}}r')
-    base_rPr = None
+
+    # Extract font/size info from the first run for the new superscript run
+    font_name = 'Calibri'
+    sz_cs     = 22
     if existing_runs:
         rPr_list = existing_runs[0].findall(f'{{{W}}}rPr')
         if rPr_list:
-            base_rPr = copy.deepcopy(rPr_list[0])
-    for r in existing_runs:
-        p_elem.remove(r)
-
-    # Run 1: main text
-    r1 = OxmlElement('w:r')
-    if base_rPr is not None:
-        r1.append(copy.deepcopy(base_rPr))
-    t1 = OxmlElement('w:t')
-    t1.text = main_text
-    r1.append(t1)
-    p_elem.append(r1)
-
-    # Run 2: superscript suffix – built via _make_run_xml to guarantee
-    # correct XML structure (inherits font/size from template rPr when available)
-    if suffix:
-        font_name = 'Calibri'
-        sz_cs     = 22
-        if base_rPr is not None:
-            rFonts_el = base_rPr.find(f'{{{W}}}rFonts')
+            bPr = rPr_list[0]
+            rFonts_el = bPr.find(f'{{{W}}}rFonts')
             if rFonts_el is not None:
-                fn = (rFonts_el.get(qn('w:ascii')) or
-                      rFonts_el.get(qn('w:hAnsi')))
+                fn = (rFonts_el.get(qn('w:ascii')) or rFonts_el.get(qn('w:hAnsi')))
                 if fn:
                     font_name = fn
-            szCs_el = base_rPr.find(f'{{{W}}}szCs')
+            szCs_el = bPr.find(f'{{{W}}}szCs')
             if szCs_el is not None:
                 try:
                     sz_cs = int(szCs_el.get(qn('w:val'), 22))
                 except (ValueError, TypeError):
                     pass
+
+    if existing_runs:
+        # Update first run IN-PLACE (preserves rPr, including yellow highlight)
+        run = existing_runs[0]
+        for spare in existing_runs[1:]:
+            p_elem.remove(spare)
+        for t_elem in run.findall(f'{{{W}}}t'):
+            run.remove(t_elem)
+        t1 = OxmlElement('w:t')
+        t1.text = main_text
+        run.append(t1)
+    else:
+        # Fallback: no existing runs
+        run = OxmlElement('w:r')
+        rPr = OxmlElement('w:rPr')
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(qn('w:ascii'), font_name)
+        rFonts.set(qn('w:hAnsi'), font_name)
+        rFonts.set(qn('w:cs'),    font_name)
+        rPr.append(rFonts)
+        run.append(rPr)
+        t1 = OxmlElement('w:t')
+        t1.text = main_text
+        run.append(t1)
+        p_elem.append(run)
+
+    # Superscript suffix (new run – no highlight, just font/size from template)
+    if suffix:
         p_elem.append(_make_run_xml(suffix, superscript=True,
                                     font_name=font_name, sz_cs=sz_cs))
 

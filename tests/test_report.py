@@ -394,6 +394,22 @@ class TestUpdateMeetingParaClearHighlight:
         assert '4 June 2026' in para.text
         assert '1 January 2026' not in para.text
 
+    def test_meeting_heading_runs_have_yellow(self):
+        """All rebuilt runs must carry explicit yellow highlight."""
+        doc  = Document()
+        para = doc.add_paragraph()
+        para.add_run(MTG_TEXT)
+        _update_meeting_para(para, '1668', '4 June 2026')
+        p_elem = para._p
+        runs = p_elem.findall(f'{{{W}}}r')
+        assert runs, 'no runs after update'
+        for r_elem in runs:
+            rPr = r_elem.find(f'{{{W}}}rPr')
+            assert rPr is not None, 'run has no rPr'
+            hl = rPr.find(f'{{{W}}}highlight')
+            assert hl is not None, 'run has no highlight element'
+            assert hl.get(qn('w:val')) == 'yellow'
+
     def test_non_r_elements_removed(self):
         """All non-pPr children (e.g. custom XML, SDT) must be removed, not only w:r."""
         doc  = Document()
