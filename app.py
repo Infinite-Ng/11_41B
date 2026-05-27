@@ -242,9 +242,11 @@ def get_capture_data(notice_id: str) -> dict:
         glob.glob(os.path.join(status_dir, '*(capture_space).*')) or
         glob.glob(os.path.join(status_dir, '*(capture space).*')) or
         glob.glob(os.path.join(status_dir, '*capture_space*.*')) or
-        glob.glob(os.path.join(status_dir, '*capture space*.*'))
+        glob.glob(os.path.join(status_dir, '*capture space*.*')) or
+        glob.glob(os.path.join(status_dir, '*capture*.*'))  # broad fallback
     )
     if not matches:
+        app.logger.warning('get_capture_data: no capture file found in %s', status_dir)
         return {'findings_review': '', 'still_exist_suffix': ''}
 
     wb = openpyxl.load_workbook(matches[0], read_only=True)
@@ -256,17 +258,27 @@ def get_capture_data(notice_id: str) -> dict:
     ]
 
     def find_col(*candidates):
+        """Case-insensitive: exact match first, then substring match."""
+        # Pass 1: exact match (case-insensitive)
         for name in candidates:
-            try:
-                return headers.index(name)
-            except ValueError:
-                pass
+            for i, h in enumerate(headers):
+                if h.lower() == name.lower():
+                    return i
+        # Pass 2: header contains the candidate (or vice-versa)
+        for name in candidates:
+            for i, h in enumerate(headers):
+                if name.lower() in h.lower() or h.lower() in name.lower():
+                    return i
         return -1
 
-    reviewed_idx = find_col('IsReviewed', 'Is Reviewed')
-    col13a_idx   = find_col('13 A', '13A', '13a', '13 a')
+    reviewed_idx = find_col('IsReviewed', 'Is Reviewed', 'Reviewed', 'reviewed')
+    col13a_idx   = find_col('13 A', '13A', '13a', '13 a', 'ART13A', 'Art13A')
 
     if reviewed_idx == -1 or col13a_idx == -1:
+        app.logger.warning(
+            'get_capture_data: columns not found in %s – headers: %s',
+            os.path.basename(matches[0]), headers
+        )
         wb.close()
         return {'findings_review': '', 'still_exist_suffix': ''}
 
@@ -334,17 +346,17 @@ def _update_meeting_para(para, wm_num: str, meeting_date: str) -> None:
         suffix  = 'th'
         num_str = str(wm_num) if wm_num else 'xxxx'
 
-    # Run 1 – 'Presented at the <number>' (bold, yellow highlight cleared)
+    # Run 1 – 'Presented at the <number>' (bold)
     p_elem.append(_make_run_xml(
-        f'Presented at the {num_str}', bold=True, clear_highlight=True
+        f'Presented at the {num_str}', bold=True
     ))
-    # Run 2 – superscript ordinal suffix (bold + superscript, highlight cleared)
+    # Run 2 – superscript ordinal suffix (bold + superscript)
     p_elem.append(_make_run_xml(
-        suffix, bold=True, superscript=True, clear_highlight=True
+        suffix, bold=True, superscript=True
     ))
-    # Run 3 – rest of the heading (bold, highlight cleared)
+    # Run 3 – rest of the heading (bold)
     p_elem.append(_make_run_xml(
-        f' meeting on {meeting_date}', bold=True, clear_highlight=True
+        f' meeting on {meeting_date}', bold=True
     ))
 
 
@@ -473,19 +485,11 @@ def _update_signoff_date(doc, date_str: str) -> None:
         full_text = para.text
         if not date_re.search(full_text):
             continue
-        # Pass 1: per-run replacement + strip yellow highlight
+        # Pass 1: per-run replacement (yellow highlight preserved intentionally)
         replaced = False
         for run in para.runs:
             if date_re.search(run.text):
                 run.text = date_re.sub(date_str, run.text)
-                r_elem = run._r
-                rPr_el = r_elem.find(f'{{{W}}}rPr')
-                if rPr_el is not None:
-                    for hl in list(rPr_el.findall(f'{{{W}}}highlight')):
-                        rPr_el.remove(hl)
-                    hl_none = OxmlElement('w:highlight')
-                    hl_none.set(qn('w:val'), 'none')
-                    rPr_el.append(hl_none)
                 replaced = True
         if not replaced:
             # Pass 2: date spans runs – merge all runs into one
@@ -500,13 +504,7 @@ def _update_signoff_date(doc, date_str: str) -> None:
                 p_elem.remove(r)
             new_run = OxmlElement('w:r')
             if base_rPr is not None:
-                # Strip yellow highlight before reusing rPr
-                for hl in list(base_rPr.findall(f'{{{W}}}highlight')):
-                    base_rPr.remove(hl)
-                hl_none = OxmlElement('w:highlight')
-                hl_none.set(qn('w:val'), 'none')
-                base_rPr.append(hl_none)
-                new_run.append(base_rPr)
+                new_run.append(base_rPr)  # yellow highlight preserved intentionally
             t = OxmlElement('w:t')
             t.text = date_re.sub(date_str, full_text)
             t.set(f'{{{NS}}}space', 'preserve')
@@ -756,6 +754,45 @@ def index():
             if os.path.isdir(folder) and os.path.isfile(mdb):
                 notice_ids.append(name)
     return render_template('index.html', notice_ids=notice_ids)
+
+
+@app.route('/api/debug/capture/<notice_id>', methods=['GET'])
+def debug_capture(notice_id):
+    """
+    Diagnostic endpoint: shows what capture file is found and what column
+    headers it contains.  Navigate to /api/debug/capture/<notice_id> to
+    troubleshoot missing 13A / still_exist_suffix values.
+    """
+    status_dir = os.path.join(BASE_DIR, 'BR_TEXT_RESULTS', notice_id, 'Status Review')
+    result = {
+        'status_dir':    status_dir,
+        'dir_exists':    os.path.isdir(status_dir),
+        'all_files':     [],
+        'capture_file':  None,
+        'headers_row1':  [],
+    }
+    if os.path.isdir(status_dir):
+        result['all_files'] = sorted(os.listdir(status_dir))
+        matches = (
+            glob.glob(os.path.join(status_dir, '*(capture_space).*')) or
+            glob.glob(os.path.join(status_dir, '*(capture space).*')) or
+            glob.glob(os.path.join(status_dir, '*capture_space*.*')) or
+            glob.glob(os.path.join(status_dir, '*capture space*.*')) or
+            glob.glob(os.path.join(status_dir, '*capture*.*'))
+        )
+        if matches:
+            result['capture_file'] = os.path.basename(matches[0])
+            try:
+                wb = openpyxl.load_workbook(matches[0], read_only=True)
+                ws = wb.active
+                result['headers_row1'] = [
+                    (str(h).strip() if h is not None else '<empty>')
+                    for h in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+                ]
+                wb.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                result['error'] = str(exc)
+    return jsonify(result)
 
 
 @app.route('/generate', methods=['POST'])

@@ -201,12 +201,11 @@ class TestUpdateSignoffDate:
         assert '27.05.2026' in doc.paragraphs[-1].text
         assert '23.09.2025' not in doc.paragraphs[-1].text
 
-    def test_yellow_highlight_cleared_single_run(self):
-        """Yellow highlight placeholder styling must be removed after replacement."""
+    def test_highlight_preserved_after_replacement(self):
+        """Yellow highlight on the sign-off date run must be kept after replacement."""
         doc  = Document()
         para = doc.add_paragraph()
         run  = para.add_run('23.09.2025')
-        # Manually add yellow highlight to simulate template placeholder
         rPr_el = OxmlElement('w:rPr')
         hl = OxmlElement('w:highlight')
         hl.set(qn('w:val'), 'yellow')
@@ -215,12 +214,14 @@ class TestUpdateSignoffDate:
 
         _update_signoff_date(doc, '27.05.2026')
 
-        # The run's highlight should now be 'none' (not 'yellow')
-        r_elem = para.runs[-1]._r
+        # Text must be replaced
+        assert '27.05.2026' in para.text
+        # Yellow highlight must STILL be there (engineers use it for secondary review)
+        r_elem = para.runs[0]._r
         rPr = r_elem.find(f'{{{W}}}rPr')
         hl_elem = rPr.find(f'{{{W}}}highlight') if rPr is not None else None
-        if hl_elem is not None:
-            assert hl_elem.get(qn('w:val')) == 'none'
+        assert hl_elem is not None, 'highlight element should still exist'
+        assert hl_elem.get(qn('w:val')) == 'yellow'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -384,20 +385,14 @@ class TestMakeRunXml:
 
 class TestUpdateMeetingParaClearHighlight:
 
-    def test_runs_have_no_yellow_highlight(self):
-        """After _update_meeting_para, no created run should have yellow highlight."""
+    def test_meeting_heading_text_correct(self):
+        """After _update_meeting_para the full heading text must be updated."""
         doc  = Document()
         para = doc.add_paragraph()
         para.add_run(MTG_TEXT)
         _update_meeting_para(para, '1668', '4 June 2026')
-        p_elem = para._p
-        for r_elem in p_elem.findall(f'{{{W}}}r'):
-            rPr = r_elem.find(f'{{{W}}}rPr')
-            if rPr is not None:
-                hl = rPr.find(f'{{{W}}}highlight')
-                if hl is not None:
-                    assert hl.get(qn('w:val')) != 'yellow', \
-                        'yellow highlight still present on a run after update'
+        assert '4 June 2026' in para.text
+        assert '1 January 2026' not in para.text
 
     def test_non_r_elements_removed(self):
         """All non-pPr children (e.g. custom XML, SDT) must be removed, not only w:r."""
