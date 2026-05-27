@@ -104,6 +104,17 @@ def _make_run_xml(
     return r
 
 
+def _all_doc_paragraphs(doc):
+    """Yield every Paragraph in the document body, including those inside
+    table cells.  Use this instead of doc.paragraphs when a paragraph may
+    be located inside a layout table (common in ITU templates)."""
+    yield from doc.paragraphs
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                yield from cell.paragraphs
+
+
 # ── Data readers ──────────────────────────────────────────────────────────────
 
 def get_mdb_data(notice_id: str) -> dict:
@@ -221,7 +232,13 @@ def get_capture_data(notice_id: str) -> dict:
     Returns empty strings for both fields if the file is not found.
     """
     status_dir = os.path.join(BASE_DIR, 'BR_TEXT_RESULTS', notice_id, 'Status Review')
-    matches    = glob.glob(os.path.join(status_dir, '*(capture_space).*'))
+    # Try several naming conventions for the capture_space file
+    matches = (
+        glob.glob(os.path.join(status_dir, '*(capture_space).*')) or
+        glob.glob(os.path.join(status_dir, '*(capture space).*')) or
+        glob.glob(os.path.join(status_dir, '*capture_space*.*')) or
+        glob.glob(os.path.join(status_dir, '*capture space*.*'))
+    )
     if not matches:
         return {'findings_review': '', 'still_exist_suffix': ''}
 
@@ -378,36 +395,75 @@ def _replace_provn_section(para, provn_targets: list) -> None:
 
 def _update_footer(doc, wm_num: str, d_num: str) -> None:
     """
-    Update the 'D <number>' document reference in all section footers.
-    Replaces 'D<optional-space><digits>' (not preceded by a letter) with
-    'D {d_num}'. Other footer content (No.11.41B, page number) is unchanged.
+    Update 'D <number>' in all section footers.
+    Iterates ALL w:t elements so multi-column table-based footers
+    (the most common ITU layout) are updated correctly.
     """
+    if not d_num:
+        return
+    d_re = re.compile(r'(?<![A-Za-z])D\s*\d+')
+    W    = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    NS   = 'http://www.w3.org/XML/1998/namespace'
     for section in doc.sections:
-        for para in section.footer.paragraphs:
-            for run in para.runs:
-                t = run.text
-                if d_num:
-                    t = re.sub(r'(?<![A-Za-z])D\s*\d+', f'D {d_num}', t)
-                run.text = t
+        for footer in (section.footer,
+                       section.even_page_footer,
+                       section.first_page_footer):
+            try:
+                ftr_elem = footer._element
+            except AttributeError:
+                continue
+            if ftr_elem is None:
+                continue
+            for t_elem in ftr_elem.iter(f'{{{W}}}t'):
+                text = t_elem.text or ''
+                if d_re.search(text):
+                    t_elem.text = d_re.sub(f'D {d_num}', text)
+                    t_elem.set(f'{{{NS}}}space', 'preserve')
 
 
 def _update_signoff_date(doc, date_str: str) -> None:
     """
-    Find the last date-pattern paragraph in the document body and replace
-    its date with date_str (e.g. '27 May 2026').
-    Searches paragraphs from the end to catch the sign-off date.
+    Find the last date-pattern paragraph in the document body (including
+    table-cell paragraphs) and replace its date with date_str.
+    Uses a two-pass strategy: per-run first; if the date spans multiple
+    runs it merges them into one new run.
     """
     date_re = re.compile(
         r'\b\d{1,2}\s+(?:January|February|March|April|May|June|July|'
         r'August|September|October|November|December)\s+\d{4}\b',
         re.IGNORECASE,
     )
-    for para in reversed(doc.paragraphs):
-        if date_re.search(para.text):
-            for run in para.runs:
-                if date_re.search(run.text):
-                    run.text = date_re.sub(date_str, run.text)
-            break
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    for para in reversed(list(_all_doc_paragraphs(doc))):
+        full_text = para.text
+        if not date_re.search(full_text):
+            continue
+        # Pass 1: per-run replacement
+        replaced = False
+        for run in para.runs:
+            if date_re.search(run.text):
+                run.text = date_re.sub(date_str, run.text)
+                replaced = True
+        if not replaced:
+            # Pass 2: date spans runs – merge all runs into one
+            p_elem        = para._p
+            existing_runs = p_elem.findall(f'{{{W}}}r')
+            base_rPr = None
+            if existing_runs:
+                rPr_list = existing_runs[0].findall(f'{{{W}}}rPr')
+                if rPr_list:
+                    base_rPr = copy.deepcopy(rPr_list[0])
+            for r in existing_runs:
+                p_elem.remove(r)
+            new_run = OxmlElement('w:r')
+            if base_rPr is not None:
+                new_run.append(base_rPr)
+            t = OxmlElement('w:t')
+            t.text = date_re.sub(date_str, full_text)
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            new_run.append(t)
+            p_elem.append(new_run)
+        break
 
 
 def _set_cell_text(cell, text: str, force_calibri: bool = False) -> None:
@@ -495,18 +551,26 @@ def _set_cell_still_exist(cell, main_text: str, suffix: str) -> None:
     r1.append(t1)
     p_elem.append(r1)
 
-    # Run 2: superscript suffix
+    # Run 2: superscript suffix – built via _make_run_xml to guarantee
+    # correct XML structure (inherits font/size from template rPr when available)
     if suffix:
-        r2   = OxmlElement('w:r')
-        rPr2 = copy.deepcopy(base_rPr) if base_rPr is not None else OxmlElement('w:rPr')
-        va   = OxmlElement('w:vertAlign')
-        va.set(qn('w:val'), 'superscript')
-        rPr2.append(va)
-        r2.append(rPr2)
-        t2 = OxmlElement('w:t')
-        t2.text = suffix
-        r2.append(t2)
-        p_elem.append(r2)
+        font_name = 'Calibri'
+        sz_cs     = 22
+        if base_rPr is not None:
+            rFonts_el = base_rPr.find(f'{{{W}}}rFonts')
+            if rFonts_el is not None:
+                fn = (rFonts_el.get(qn('w:ascii')) or
+                      rFonts_el.get(qn('w:hAnsi')))
+                if fn:
+                    font_name = fn
+            szCs_el = base_rPr.find(f'{{{W}}}szCs')
+            if szCs_el is not None:
+                try:
+                    sz_cs = int(szCs_el.get(qn('w:val'), 22))
+                except (ValueError, TypeError):
+                    pass
+        p_elem.append(_make_run_xml(suffix, superscript=True,
+                                    font_name=font_name, sz_cs=sz_cs))
 
 
 def _replace_table_data(table, notice_data_list: list) -> None:
@@ -594,14 +658,15 @@ def generate_report(
     # ── Load a fresh copy of the template ────────────────────────────────────
     doc = Document(TEMPLATE_PATH)
 
-    # ── 1. Update meeting header paragraph ───────────────────────────────────
-    for para in doc.paragraphs:
-        if 'meeting on' in para.text:
+    # ── 1. Update meeting header paragraph (body + table-cell paragraphs) ────
+    _mtg_re = re.compile(r'meeting\s+on\b', re.IGNORECASE)
+    for para in _all_doc_paragraphs(doc):
+        if _mtg_re.search(para.text):
             _update_meeting_para(para, wm_num, meeting_date)
             break
 
     # ── 2. Replace provn_target section in coordination paragraph ────────────
-    for para in doc.paragraphs:
+    for para in _all_doc_paragraphs(doc):
         if 'coordination agreement with the concerned administrations' in para.text:
             _replace_provn_section(para, combined_provn_targets)
             break
