@@ -331,7 +331,7 @@ def get_capture_data(notice_id: str) -> dict:
     )
     return {
         'findings_review':    findings_review,
-        'still_exist_suffix': f'{letter}{number}',
+        'still_exist_suffix': f'{letter}, {number}' if number else letter,
     }
 
 # ── Document builders ─────────────────────────────────────────────────────────
